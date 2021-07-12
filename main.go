@@ -2,78 +2,115 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 )
 
-func main() {
-	numbers := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-
-	input := buffer(numbers)
-
-	re1 := getInputChan(input)
-
-	merged := fanIn(re1)
-
-	for i := range merged {
-		fmt.Println(i)
-	}
+type Item struct {
+	ID            int
+	Name          string
+	PackingEffort time.Duration
 }
 
-func buffer(numbers []int) <-chan int {
-	input := make(chan int)
+func main() {
+	done := make(chan bool)
+	defer close(done)
+
+	items := PrepareItems(done)
+
+	cpus := runtime.NumCPU()
+	workers := make([]<-chan int, cpus)
+	start := time.Now()
+	for i := 0; i < cpus; i++ {
+		workers[i] = PackItems(done, items, i)
+	}
+
+	merged := fanIn(done, workers...)
+	numPackages := 0
+
+	for range merged {
+		numPackages++
+	}
+
+	fmt.Printf("Took %fs to ship %d packages\n", time.Since(start).Seconds(), numPackages)
+}
+
+func PrepareItems(done <-chan bool) <-chan Item {
+	input := make(chan Item)
+
+	items := []Item{
+		Item{0, "Shirt", 1 * time.Second},
+		Item{1, "Legos", 1 * time.Second},
+		Item{2, "TV", 3 * time.Second},
+		Item{3, "Bananas", 2 * time.Second},
+		Item{4, "Hat", 1 * time.Second},
+		Item{5, "Phone", 2 * time.Second},
+		Item{6, "Plates", 3 * time.Second},
+		Item{7, "Computer", 3 * time.Second},
+		Item{8, "Pint Glass", 3 * time.Second},
+		Item{9, "Watch", 2 * time.Second},
+		Item{4, "Hat", 1 * time.Second},
+		Item{5, "Phone", 2 * time.Second},
+		Item{6, "Plates", 3 * time.Second},
+		Item{7, "Computer", 3 * time.Second},
+		Item{8, "Pint Glass", 3 * time.Second},
+		Item{9, "Watch", 2 * time.Second},
+	}
 
 	go func() {
-		for num := range numbers {
-			input <- num
+		for _, item := range items {
+			select {
+			case <-done:
+				return
+			case input <- item:
+			}
 		}
 		close(input)
 	}()
-
 	return input
 }
 
-func getInputChan(input <-chan int) <-chan int {
-	output := make(chan int)
+func PackItems(done <-chan bool, items <-chan Item, workerID int) <-chan int {
+	packages := make(chan int)
 
 	go func() {
-		defer close(output)
-		for num := range input {
-			time.Sleep(time.Duration(time.Second))
-			output <- num * num
+		for item := range items {
+			select {
+			case <-done:
+				return
+			case packages <- item.ID:
+				time.Sleep(item.PackingEffort)
+				fmt.Printf("Worker #%d: Shipping package no. %d, took %ds to pack\n", workerID, item.ID, item.PackingEffort/time.Second)
+			}
 		}
+		close(packages)
 	}()
 
-	return output
+	return packages
 }
 
-func fanIn(chans ...<-chan int) <-chan int {
+func fanIn(done <-chan bool, channels ...<-chan int) <-chan int {
 	var wg sync.WaitGroup
 
-	output := make(chan int)
-
-	// increase counter to number of channels `len(outputsChan)`
-	// as we will spawn number of goroutines equal to number of channels received to merge
-	wg.Add(len(chans))
-
-	for _, optChan := range chans {
-		go func(sc <-chan int) {
-			// run until channel (square numbers sender) closes
-			for sqr := range sc {
-				output <- sqr
+	wg.Add(len(channels))
+	outgoingPackages := make(chan int)
+	multiplex := func(c <-chan int) {
+		defer wg.Done()
+		for i := range c {
+			select {
+			case <-done:
+				return
+			case outgoingPackages <- i:
 			}
-			// once channel (square numbers sender) closes,
-			// call `Done` on `WaitGroup` to decrement counter
-			wg.Done()
-		}(optChan)
+		}
 	}
-
-	// run goroutine to close merged channel once done
+	for _, c := range channels {
+		go multiplex(c)
+	}
 	go func() {
-		// wait until WaitGroup finishesh
 		wg.Wait()
-		close(output)
+		close(outgoingPackages)
 	}()
-
-	return output
+	return outgoingPackages
 }
